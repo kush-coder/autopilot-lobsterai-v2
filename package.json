@@ -262,7 +262,7 @@
     "@univerjs/sheets-find-replace": "1.0.2",
     "@univerjs/sheets-formula": "1.0.2",
     "@univerjs/sheets-formula-ui": "1.0.2",
-    "@univerjs/sheets-hyper-link": "1.0.2",
+    "@univerjs/sheets-hyper-link": "1.2.0",
     "@univerjs/sheets-hyper-link-ui": "1.0.2",
     "@univerjs/sheets-note": "1.0.2",
     "@univerjs/sheets-note-ui": "1.0.2",
