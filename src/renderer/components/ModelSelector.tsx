@@ -1,0 +1,1621 @@
+import {
+  CheckIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  ClockIcon,
+  GiftIcon,
+  LockClosedIcon,
+  XMarkIcon,
+} from '@heroicons/react/24/outline';
+import {
+  getModelThinkingLevels,
+  ModelRuntimeProfile,
+  type ModelThinkingConfig,
+  type ModelThinkingLevel as ModelThinkingLevelType,
+  ProviderName,
+  supportsLobsterAIRequestOptionsV1,
+} from '@shared/providers';
+import React from 'react';
+import { createPortal } from 'react-dom';
+import { useDispatch, useSelector } from 'react-redux';
+
+import { ModelPresetId } from '../../shared/modelPresets/constants';
+import { getProviderIcon, ProviderIconId } from '../providers/uiRegistry';
+import { authService } from '../services/auth';
+import { getPortalPricingUrl } from '../services/endpoints';
+import { i18nService } from '../services/i18n';
+import { modelPresetName } from '../services/modelPresets';
+import {
+  readRememberedModelThinkingLevel,
+  rememberModelThinkingLevel,
+} from '../services/modelThinkingLevelMemory';
+import { RootState } from '../store';
+import type { Model } from '../store/slices/modelSlice';
+import { getModelIdentityKey, isSameModelIdentity, ServerModelLoadStatus, setSelectedModel } from '../store/slices/modelSlice';
+import { AccountConnectionNotice } from './AccountConnectionNotice';
+import { getAccountConnectionState, getModelConnectionState } from './accountConnectionState';
+import Modal from './common/Modal';
+import { resolvePopoverPlacement } from './cowork/popoverPlacement';
+import BalancedModelIcon from './icons/BalancedModelIcon';
+import BusyModelIcon from './icons/BusyModelIcon';
+import { CustomProviderIcon } from './icons/providers';
+import UltimateModelIcon from './icons/UltimateModelIcon';
+import VipDiamondLineIcon from './icons/VipDiamondLineIcon';
+import ModelAccessPromptPopover from './modelSelector/ModelAccessPromptPopover';
+import ModelThinkingMenu, {
+  getModelThinkingLevelLabel,
+} from './modelSelector/ModelThinkingMenu';
+import { useModelPurchaseOffer } from './modelSelector/useModelPurchaseOffer';
+import PurchaseOfferCountdown from './PurchaseOfferCountdown';
+import Tooltip, { TooltipPosition } from './ui/Tooltip';
+
+interface ModelSelectorProps {
+  allowPresets?: boolean;
+  dropdownDirection?: 'up' | 'down' | 'auto';
+  /**
+   * Controlled mode: the currently selected Model (or `null` for "default").
+   * When provided, the component does NOT read/write Redux global state.
+   */
+  value?: Model | null;
+  /** Controlled mode callback. `null` means the user picked "default". */
+  onChange?: (model: Model | null, meta: ModelSelectorChangeMeta) => void;
+  /** Reuse the host composer's login flow when a plan model requires sign-in. */
+  onLoginRequired?: () => void;
+  /** Show a "default" option at the top of the dropdown (controlled mode only). */
+  defaultLabel?: string;
+  /** Disable interaction while the selected model is being persisted. */
+  disabled?: boolean;
+  /** Use a denser trigger for compact toolbars. */
+  compact?: boolean;
+  /** Show just the provider avatar, with the full model name in its tooltip. */
+  iconOnly?: boolean;
+  /** Keep access prompts beside the selector in transparent companion windows. */
+  anchorAccessPrompt?: boolean;
+  /** Render the dropdown outside the local stacking context. */
+  portal?: boolean;
+  /** Align the dropdown's trailing edge with the trigger's trailing edge. */
+  alignDropdownToTriggerEnd?: boolean;
+  /** Override the trigger's max width while keeping the default selector behavior. */
+  triggerMaxWidthClassName?: string;
+  /** Keep the custom-model badge to its short label when the trigger is tightly capped. */
+  hideCustomProviderName?: boolean;
+  /** Persisted thinking level for the selected model. Omit to hide the thinking control. */
+  thinkingLevel?: ModelThinkingLevelType | null;
+}
+
+const DROPDOWN_MAX_HEIGHT = 380; // list max-h-72 plus the tab area and current-model footer
+// Compact rows reserve separate columns for names, tags, multipliers and status.
+// Long names truncate consistently instead of pushing the other columns around.
+const DROPDOWN_WIDTH = 360;
+const MODEL_ITEM_HEIGHT = 36; // py-2 row with a 20px line
+const LIST_VERTICAL_PADDING = 8; // scroll container py-1
+const LIST_MAX_HEIGHT = 288; // default cap for the scrollable model list (18rem)
+const LIST_MIN_HEIGHT = MODEL_ITEM_HEIGHT * 3 + LIST_VERTICAL_PADDING; // never collapse below three rows
+const DROPDOWN_VIEWPORT_MARGIN = 8;
+const DROPDOWN_TRIGGER_GAP = 4; // matches mt-1/mb-1 and the +4 offset in portal mode
+const DROPDOWN_TABS_BLOCK_HEIGHT = 49; // group tabs block: p-2 + p-0.5 + py-1.5 + leading-4 + border-b
+const DROPDOWN_FOOTER_HEIGHT = 33; // current-model footer: py-2 + leading-4 + border-t
+const DROPDOWN_BORDER_HEIGHT = 2;
+const HOVER_CARD_WIDTH = 220;
+const HOVER_CARD_VIEWPORT_MARGIN = 8;
+const HOVER_CLOSE_DELAY = 180;
+const THINKING_MENU_WIDTH = 210;
+// Cascaded popovers sit flush against their anchor: no gap that makes the stack
+// look disconnected, and no overlap that makes the panels look stacked.
+const CASCADE_OVERLAP = 0;
+const MODEL_ICON_CLASS_NAME = 'h-[18px] w-[18px]';
+export const CascadeSide = {
+  Left: 'left',
+  Right: 'right',
+} as const;
+export type CascadeSide = typeof CascadeSide[keyof typeof CascadeSide];
+export const ModelSelectorGroup = {
+  Server: 'server',
+  User: 'user',
+} as const;
+type ModelSelectorGroup = typeof ModelSelectorGroup[keyof typeof ModelSelectorGroup];
+
+export interface ModelSelectorSections {
+  primaryModels: Model[];
+  moreModels: Model[];
+}
+
+export const partitionModelSelectorModels = (models: Model[]): ModelSelectorSections => ({
+  primaryModels: models.filter(model => model.moreModel !== true),
+  moreModels: models.filter(model => model.moreModel === true),
+});
+
+export const countVisibleModelSelectorRows = (
+  models: Model[],
+  moreModelsExpanded: boolean,
+): number => {
+  const sections = partitionModelSelectorModels(models);
+  return sections.primaryModels.length
+    + (sections.moreModels.length > 0 ? 1 : 0)
+    + (moreModelsExpanded ? sections.moreModels.length : 0);
+};
+
+export const shouldRenderSelectedModelUnavailableFallback = (
+  availableModelCount: number,
+  selectedModel: Model | null | undefined,
+  isLoggedIn: boolean,
+): selectedModel is Model & { isServerModel: true } => (
+  isLoggedIn
+  && availableModelCount === 0
+  && selectedModel?.isServerModel === true
+);
+
+/**
+ * Logged out with nothing to list (public catalog still loading or failed):
+ * point at login, which unlocks the plan models, not at custom model setup.
+ */
+export const shouldRenderPlanModelLoginPrompt = (
+  availableModelCount: number,
+  isLoggedIn: boolean,
+): boolean => !isLoggedIn && availableModelCount === 0;
+
+export interface ModelSelectorChangeMeta {
+  group: ModelSelectorGroup;
+  thinkingLevel?: ModelThinkingLevelType;
+}
+
+export const ModelAccessPromptKind = {
+  AgenticNotReady: 'agentic_not_ready',
+  Busy: 'busy',
+  Login: 'login',
+  Subscribe: 'subscribe',
+  SubscriptionPriority: 'subscription_priority',
+} as const;
+export type ModelAccessPromptKind = typeof ModelAccessPromptKind[keyof typeof ModelAccessPromptKind];
+
+interface ModelAccessPromptModalProps {
+  promptKind: ModelAccessPromptKind;
+  onClose: () => void;
+  titleKey?: string;
+  descriptionKey?: string;
+  primaryButtonKey?: string;
+  showLearnMore?: boolean;
+  anchorRef?: React.RefObject<HTMLElement>;
+  onChooseModel?: () => void;
+}
+
+export const ModelAccessPromptModal: React.FC<ModelAccessPromptModalProps> = ({
+  promptKind,
+  onClose,
+  titleKey,
+  descriptionKey,
+  primaryButtonKey,
+  showLearnMore = true,
+  anchorRef,
+  onChooseModel,
+}) => {
+  const busyPrompt = promptKind === ModelAccessPromptKind.Busy;
+  const agenticNotReadyPrompt = promptKind === ModelAccessPromptKind.AgenticNotReady;
+  const loginPrompt = promptKind === ModelAccessPromptKind.Login;
+  const purchaseOffer = useModelPurchaseOffer(promptKind === ModelAccessPromptKind.Subscribe, onClose);
+  const resolvedTitleKey = titleKey ?? (
+    busyPrompt ? 'modelBusyBadge' : agenticNotReadyPrompt
+      ? 'modelSelectorAgenticNotReadyTitle'
+      : loginPrompt ? 'modelSelectorLoginTitle' : 'modelSelectorSubscribeTitle'
+  );
+  const resolvedDescriptionKey = descriptionKey ?? (
+    busyPrompt ? 'modelBusyHint' : agenticNotReadyPrompt
+      ? 'serverModelAgenticNotReady'
+      : loginPrompt ? 'modelSelectorLoginDesc'
+        : promptKind === ModelAccessPromptKind.SubscriptionPriority ? 'modelSubscriptionPriorityHint' : 'modelSelectorSubscribeDesc'
+  );
+  const resolvedPrimaryButtonKey = primaryButtonKey ?? (
+    busyPrompt ? 'close' : agenticNotReadyPrompt
+      ? 'modelSelectorAgenticNotReadyBtn'
+      : loginPrompt ? 'modelSelectorLoginBtn' : 'modelSelectorSubscribeBtn'
+  );
+
+  const openSubscriptionPage = async () => {
+    const pricingUrl = promptKind === ModelAccessPromptKind.SubscriptionPriority
+      ? getPortalPricingUrl(undefined, { tab: 'subscription' }) : purchaseOffer.getPricingUrl();
+    if (!pricingUrl) return;
+    onClose();
+    await window.electron.shell.openExternal(pricingUrl);
+  };
+
+  const handlePrimary = async () => {
+    if (promptKind === ModelAccessPromptKind.Login) {
+      onClose();
+      await authService.login();
+      return;
+    }
+    if (busyPrompt || promptKind === ModelAccessPromptKind.AgenticNotReady) {
+      onClose();
+      return;
+    }
+    await openSubscriptionPage();
+  };
+
+  if (anchorRef) {
+    const subscriptionPriority = promptKind === ModelAccessPromptKind.SubscriptionPriority;
+    const purchase = subscriptionPriority || promptKind === ModelAccessPromptKind.Subscribe;
+    return (
+      <ModelAccessPromptPopover
+        anchorRef={anchorRef}
+        title={i18nService.t(subscriptionPriority ? 'modelSelectorSubscriptionRequiredTitle' : resolvedTitleKey)}
+        description={purchaseOffer.description ?? i18nService.t(subscriptionPriority ? 'modelSelectorSubscriptionRequiredDesc' : resolvedDescriptionKey)}
+        primaryLabel={i18nService.t(subscriptionPriority ? 'modelSelectorViewSubscription' : resolvedPrimaryButtonKey)}
+        purchase={purchase}
+        pending={purchaseOffer.isRefreshing}
+        onPrimary={() => { void handlePrimary(); }}
+        onClose={onClose}
+        onChooseModel={onChooseModel}
+      >
+        {purchaseOffer.offer?.expiresAtEpochMs != null && (
+          <div className="mt-3"><PurchaseOfferCountdown offer={purchaseOffer.offer} /></div>
+        )}
+      </ModelAccessPromptPopover>
+    );
+  }
+
+  return (
+    <Modal
+      onClose={onClose}
+      overlayClassName="fixed inset-0 z-[10050] flex items-center justify-center modal-backdrop px-4"
+      className="modal-content w-full max-w-sm rounded-2xl border border-border bg-surface p-5 shadow-modal"
+    >
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <div className="text-base font-semibold leading-6 text-foreground">
+            {i18nService.t(resolvedTitleKey)}
+          </div>
+          <div className="mt-1.5 text-sm leading-5 text-secondary">
+            {purchaseOffer.description ?? i18nService.t(resolvedDescriptionKey)}
+          </div>
+          {purchaseOffer.offer?.expiresAtEpochMs != null && (
+            <div className="mt-3">
+              <PurchaseOfferCountdown offer={purchaseOffer.offer} />
+            </div>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={onClose}
+          className="-mr-1 -mt-1 rounded-lg p-1 text-secondary transition-colors hover:bg-surface-raised hover:text-foreground"
+          aria-label={i18nService.t('close')}
+        >
+          <XMarkIcon className="h-5 w-5" />
+        </button>
+      </div>
+      <button
+        type="button"
+        onClick={() => { void handlePrimary(); }}
+        disabled={purchaseOffer.isRefreshing}
+        className="mt-5 w-full rounded-lg bg-primary px-3 py-2.5 text-sm font-medium text-white transition-colors hover:bg-primary/90 disabled:cursor-wait disabled:opacity-50"
+      >
+        {i18nService.t(resolvedPrimaryButtonKey)}
+      </button>
+      {loginPrompt && showLearnMore && (
+        <button
+          type="button"
+          onClick={() => { void openSubscriptionPage(); }}
+          className="mt-3 w-full text-center text-sm text-secondary transition-colors hover:text-foreground"
+        >
+          {i18nService.t('modelSelectorLearnMore')}
+        </button>
+      )}
+    </Modal>
+  );
+};
+
+export function resolveDropdownListMaxHeight(
+  availableSpace: number,
+  hasGroupTabs: boolean,
+  hasCurrentModelFooter: boolean,
+): number {
+  const chromeHeight = DROPDOWN_BORDER_HEIGHT
+    + (hasGroupTabs ? DROPDOWN_TABS_BLOCK_HEIGHT : 0)
+    + (hasCurrentModelFooter ? DROPDOWN_FOOTER_HEIGHT : 0);
+  return Math.min(Math.max(availableSpace - chromeHeight, LIST_MIN_HEIGHT), LIST_MAX_HEIGHT);
+}
+
+export function resolveHoverCardTop(
+  desiredTop: number,
+  cardHeight: number,
+  viewportHeight: number,
+  viewportMargin = HOVER_CARD_VIEWPORT_MARGIN,
+): number {
+  const maxTop = Math.max(viewportMargin, viewportHeight - cardHeight - viewportMargin);
+  return Math.min(Math.max(desiredTop, viewportMargin), maxTop);
+}
+
+/**
+ * Places a cascaded popover (hover card, thinking menu) next to its anchor.
+ * The popover keeps flowing towards `preferredSide` so the stack never
+ * zig-zags back across the panel it came from, and only flips when the
+ * preferred side cannot fit inside the viewport.
+ */
+export function resolveCascadePlacement(options: {
+  anchorLeft: number;
+  anchorRight: number;
+  width: number;
+  viewportWidth: number;
+  preferredSide: CascadeSide;
+  overlap?: number;
+  viewportMargin?: number;
+}): { left: number; side: CascadeSide } {
+  const {
+    anchorLeft,
+    anchorRight,
+    width,
+    viewportWidth,
+    preferredSide,
+    overlap = CASCADE_OVERLAP,
+    viewportMargin = HOVER_CARD_VIEWPORT_MARGIN,
+  } = options;
+  const rightSideLeft = anchorRight - overlap;
+  const leftSideLeft = anchorLeft + overlap - width;
+  const fitsRight = rightSideLeft + width + viewportMargin <= viewportWidth;
+  const fitsLeft = leftSideLeft >= viewportMargin;
+  const side = preferredSide === CascadeSide.Right
+    ? (fitsRight || !fitsLeft ? CascadeSide.Right : CascadeSide.Left)
+    : (fitsLeft || !fitsRight ? CascadeSide.Left : CascadeSide.Right);
+  const desiredLeft = side === CascadeSide.Right ? rightSideLeft : leftSideLeft;
+  const maxLeft = Math.max(viewportMargin, viewportWidth - width - viewportMargin);
+  return { left: Math.min(Math.max(desiredLeft, viewportMargin), maxLeft), side };
+}
+
+/**
+ * A third cascaded panel must not flip inward across its parent and cover the
+ * model dropdown. When the outward side is exhausted (notably at the 800px
+ * minimum window width), overlay the hover card itself instead; its 220px
+ * surface is wider than the 210px thinking menu and remains pointer-adjacent.
+ */
+export function resolveNestedCascadePlacement(options: Parameters<typeof resolveCascadePlacement>[0]): {
+  left: number;
+  side: CascadeSide;
+  overlaysAnchor: boolean;
+} {
+  const placement = resolveCascadePlacement(options);
+  if (placement.side === options.preferredSide) {
+    return { ...placement, overlaysAnchor: false };
+  }
+
+  const viewportMargin = options.viewportMargin ?? HOVER_CARD_VIEWPORT_MARGIN;
+  const maxLeft = Math.max(viewportMargin, options.viewportWidth - options.width - viewportMargin);
+  return {
+    left: Math.min(Math.max(options.anchorLeft, viewportMargin), maxLeft),
+    side: options.preferredSide,
+    overlaysAnchor: true,
+  };
+}
+
+/**
+ * Thinking level the picker should show for one model, in precedence order:
+ *
+ * 1. the level being requested right now (the user just clicked it);
+ * 2. the level persisted for the agent/session, but only for the model that is
+ *    actually selected — that record holds a single level, so it says nothing
+ *    about the other models in the list;
+ * 3. the level the user last picked for this specific model;
+ * 4. the model's built-in default.
+ *
+ * Step 3 is what keeps two models from sharing one level: without it, every
+ * model except the selected one falls back to its default, so switching models
+ * silently discards the level chosen for the previous one.
+ */
+export function resolvePickerThinkingLevel(options: {
+  config: ModelThinkingConfig;
+  requestedLevel?: ModelThinkingLevelType;
+  selectedModelLevel?: ModelThinkingLevelType | null;
+  rememberedLevel?: ModelThinkingLevelType;
+}): ModelThinkingLevelType {
+  const { config, requestedLevel, selectedModelLevel, rememberedLevel } = options;
+  const levels = getModelThinkingLevels(config);
+  const candidates = [requestedLevel, selectedModelLevel, rememberedLevel];
+  return candidates.find(
+    (level): level is ModelThinkingLevelType => !!level && levels.includes(level),
+  ) ?? config.defaultLevel;
+}
+
+export function isModelAgenticBlocked(
+  model: Pick<Model, 'agenticReady' | 'isServerModel' | 'runtimeProfile'> | null | undefined,
+): boolean {
+  return model?.isServerModel === true
+    && model.runtimeProfile === ModelRuntimeProfile.MoonshotKimiK3
+    && model.agenticReady !== true;
+}
+
+export function canConfigureModelThinking(
+  model: Pick<
+    Model,
+    | 'accessible'
+    | 'busy'
+    | 'agenticReady'
+    | 'isServerModel'
+    | 'presetId'
+    | 'requestCapabilities'
+    | 'runtimeProfile'
+    | 'thinkingConfig'
+  > | null | undefined,
+): boolean {
+  return !!model?.thinkingConfig
+    && !model.presetId
+    && supportsLobsterAIRequestOptionsV1(model.requestCapabilities)
+    && model.accessible !== false
+    && model.busy !== true
+    && !isModelAgenticBlocked(model);
+}
+
+export function supportsConfigurableModelThinkingProtocol(
+  model: Pick<Model, 'presetId' | 'requestCapabilities' | 'thinkingConfig'> | null | undefined,
+): boolean {
+  return !!model?.thinkingConfig
+    && !model.presetId
+    && supportsLobsterAIRequestOptionsV1(model.requestCapabilities);
+}
+
+/** Whether hovering a row opens the detail card (which also shows the full name). */
+export function hasModelHoverDetails(
+  model: Pick<
+    Model,
+    | 'agenticReady'
+    | 'costMultiplier'
+    | 'description'
+    | 'isServerModel'
+    | 'runtimeProfile'
+    | 'supportsImage'
+    | 'supportsThinking'
+    | 'thinkingConfig'
+    | 'subscriptionPriority'
+    | 'busy'
+  >,
+): boolean {
+  return !!model.busy
+    || !!model.subscriptionPriority
+    || !!model.description
+    || !!model.costMultiplier
+    || !!model.supportsImage
+    || !!model.supportsThinking
+    || !!model.thinkingConfig
+    || isModelAgenticBlocked(model);
+}
+
+/**
+ * Channel name for the custom-model badge. The live model list wins over the
+ * persisted selection so a renamed provider shows its current name.
+ */
+export function resolveCustomModelProviderName(
+  selectedModel: Pick<Model, 'provider'> | null | undefined,
+  currentModelMetadata: Pick<Model, 'provider'> | undefined,
+): string {
+  return (currentModelMetadata?.provider ?? selectedModel?.provider ?? '').trim();
+}
+
+const MODEL_ICON_PROVIDER_HINTS: Array<{ pattern: RegExp; providerName: ProviderName | ProviderIconId }> = [
+  { pattern: /doubao|豆包/i, providerName: ProviderIconId.Doubao },
+  { pattern: /deepseek/i, providerName: ProviderName.DeepSeek },
+  { pattern: /minimax/i, providerName: ProviderName.Minimax },
+  { pattern: /kimi|moonshot/i, providerName: ProviderName.Moonshot },
+  { pattern: /glm|zhipu/i, providerName: ProviderName.Zhipu },
+  { pattern: /qwen|qwq|qvq/i, providerName: ProviderName.Qwen },
+  { pattern: /claude|anthropic/i, providerName: ProviderName.Anthropic },
+  { pattern: /gemini/i, providerName: ProviderName.Gemini },
+  { pattern: /gpt|openai/i, providerName: ProviderName.OpenAI },
+  { pattern: /hy3|youdao/i, providerName: ProviderName.Youdaozhiyun },
+];
+
+const ModelSelector: React.FC<ModelSelectorProps> = ({
+  dropdownDirection = 'auto',
+  value,
+  onChange,
+  onLoginRequired,
+  defaultLabel,
+  disabled = false,
+  compact = false,
+  iconOnly = false,
+  anchorAccessPrompt = false,
+  portal = false,
+  alignDropdownToTriggerEnd = false,
+  triggerMaxWidthClassName,
+  hideCustomProviderName = false,
+  thinkingLevel,
+  allowPresets = true,
+}) => {
+  const dispatch = useDispatch();
+  const [isOpen, setIsOpen] = React.useState(false);
+  const [resolvedDirection, setResolvedDirection] = React.useState<'up' | 'down'>('down');
+  const [portalStyle, setPortalStyle] = React.useState<React.CSSProperties>({});
+  const [inPlacePlacement, setInPlacePlacement] = React.useState(() => ({
+    alignEnd: alignDropdownToTriggerEnd,
+    width: DROPDOWN_WIDTH,
+  }));
+  const [listMaxHeight, setListMaxHeight] = React.useState<number>(LIST_MAX_HEIGHT);
+  const [activeGroup, setActiveGroup] = React.useState<ModelSelectorGroup>(ModelSelectorGroup.Server);
+  const [moreModelsExpanded, setMoreModelsExpanded] = React.useState(false);
+  const containerRef = React.useRef<HTMLDivElement>(null);
+  const dropdownRef = React.useRef<HTMLDivElement>(null);
+  const scrollContainerRef = React.useRef<HTMLDivElement>(null);
+  const selectedItemRef = React.useRef<HTMLButtonElement>(null);
+  const moreModelsSectionRef = React.useRef<HTMLDivElement>(null);
+  const revealMoreModelsOnExpandRef = React.useRef(false);
+  const [hoveredModel, setHoveredModel] = React.useState<Model | null>(null);
+  const [hoverCardStyle, setHoverCardStyle] = React.useState<React.CSSProperties>({});
+  const [hoverCardSide, setHoverCardSide] = React.useState<CascadeSide>(CascadeSide.Right);
+  const [isThinkingMenuOpen, setIsThinkingMenuOpen] = React.useState(false);
+  const [thinkingMenuStyle, setThinkingMenuStyle] = React.useState<React.CSSProperties>({});
+  const [restrictedPrompt, setRestrictedPrompt] = React.useState<ModelAccessPromptKind | null>(null);
+  const hoverCardRef = React.useRef<HTMLDivElement>(null);
+  const thinkingMenuRef = React.useRef<HTMLDivElement>(null);
+  const thinkingMenuTriggerRef = React.useRef<HTMLButtonElement>(null);
+  const hoverTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hoverCloseTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const controlled = onChange !== undefined;
+  const thinkingSelectionEnabled = controlled && thinkingLevel !== undefined;
+  const globalSelectedModel = useSelector((state: RootState) => state.model.defaultSelectedModel);
+  const currentAgentId = useSelector((state: RootState) => state.agent.currentAgentId);
+  const auth = useSelector((state: RootState) => state.auth);
+  const { isLoggedIn } = auth;
+  const accountConnectionState = getAccountConnectionState(auth);
+  const serverModelLoadStatus = useSelector((state: RootState) => state.model.serverModelLoadStatus);
+  const availableModels = useSelector((state: RootState) => state.model.availableModels);
+  const connectionState = getModelConnectionState(
+    auth,
+    serverModelLoadStatus,
+    availableModels.some(model => model.isServerModel),
+  );
+  const selectedValue = controlled ? value ?? null : globalSelectedModel;
+  const currentModelMetadata = selectedValue
+    ? availableModels.find(model => isSameModelIdentity(model, selectedValue)) : undefined;
+  const selectedModel = React.useMemo(() => selectedValue && currentModelMetadata
+    ? { ...selectedValue, busy: currentModelMetadata.busy, accessible: currentModelMetadata.accessible }
+    : selectedValue, [selectedValue, currentModelMetadata]);
+  const isCustomModelSelected = Boolean(selectedModel?.providerKey
+    && !selectedModel.isServerModel
+    && selectedModel.providerKey !== ProviderName.LobsteraiServer);
+  const customProviderName = isCustomModelSelected
+    ? resolveCustomModelProviderName(selectedModel, currentModelMetadata)
+    : '';
+  const showCustomProviderName = Boolean(customProviderName) && !hideCustomProviderName;
+  const selectedModelKey = selectedModel ? getModelIdentityKey(selectedModel) : '';
+  const serverModels = availableModels.filter(m => m.isServerModel && (allowPresets || !m.presetId))
+    .map(model => model.presetId && model.presetId === selectedModel?.presetId
+      ? { ...selectedModel, costMultiplier: model.costMultiplier } : model);
+  const userModels = availableModels.filter(m => !m.isServerModel);
+  const modelGroups = [
+    ...(serverModels.length > 0
+      ? [{ key: ModelSelectorGroup.Server, label: i18nService.t('modelGroupServer') }]
+      : []),
+    ...(userModels.length > 0
+      ? [{ key: ModelSelectorGroup.User, label: i18nService.t('modelGroupUser') }]
+      : []),
+  ];
+  const shouldShowGroupTabs = serverModels.length > 0;
+  const isGroupAvailable = (group: ModelSelectorGroup): boolean => (
+    group === ModelSelectorGroup.Server ? serverModels.length > 0 : userModels.length > 0
+  );
+  const getModelGroup = (model: Model | null): ModelSelectorGroup | null => {
+    if (!model) return null;
+    return model.isServerModel ? ModelSelectorGroup.Server : ModelSelectorGroup.User;
+  };
+  const selectedModelGroup = getModelGroup(selectedModel);
+  const showCurrentModelFooter = shouldShowGroupTabs && selectedModel !== null && selectedModelGroup !== null;
+  const getPreferredGroup = (): ModelSelectorGroup => {
+    const selectedGroup = getModelGroup(selectedModel);
+    if (selectedGroup && isGroupAvailable(selectedGroup)) return selectedGroup;
+    return serverModels.length > 0 ? ModelSelectorGroup.Server : ModelSelectorGroup.User;
+  };
+  const visibleGroup = isGroupAvailable(activeGroup) ? activeGroup : getPreferredGroup();
+  const visibleModels = shouldShowGroupTabs
+    ? (visibleGroup === ModelSelectorGroup.Server ? serverModels : userModels)
+    : availableModels;
+  const visibleSections = partitionModelSelectorModels(visibleModels);
+  // Keep the list height identical across tabs so switching never resizes the dropdown.
+  const largestGroupRowCount = Math.max(
+    countVisibleModelSelectorRows(serverModels, moreModelsExpanded),
+    countVisibleModelSelectorRows(userModels, moreModelsExpanded),
+  ) + (defaultLabel ? 1 : 0);
+  const stableListMinHeight = shouldShowGroupTabs
+    ? Math.min(largestGroupRowCount * MODEL_ITEM_HEIGHT + LIST_VERTICAL_PADDING, LIST_MAX_HEIGHT)
+    : undefined;
+  const showSelectedModelUnavailableFallback = serverModelLoadStatus !== ServerModelLoadStatus.Ready
+    && shouldRenderSelectedModelUnavailableFallback(
+      availableModels.length,
+      selectedModel,
+      isLoggedIn,
+    );
+  const selectedModelUnavailableFallbackLogKey = showSelectedModelUnavailableFallback
+    ? `${selectedModel.providerKey ?? ''}:${selectedModel.id}`
+    : '';
+  const selectedModelUnavailableFallbackLogKeyRef = React.useRef('');
+  const triggerMaxWidthClass = triggerMaxWidthClassName
+    ?? (compact
+      ? (showCustomProviderName ? 'max-w-[320px]' : isCustomModelSelected ? 'max-w-[260px]' : 'max-w-[220px]')
+      : (showCustomProviderName ? 'max-w-[340px]' : 'max-w-[280px]'));
+  const triggerClassName = iconOnly
+    ? 'relative h-8 w-8 shrink-0 justify-center rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30'
+    : compact
+      ? `space-x-1.5 px-2 py-1 rounded-lg ${triggerMaxWidthClass}`
+      : `space-x-2 px-3 py-1.5 rounded-xl ${triggerMaxWidthClass}`;
+  const triggerLabel = selectedModel?.presetId
+    ? modelPresetName(selectedModel.presetId)
+    : selectedModel?.name ?? defaultLabel ?? i18nService.t('selectModel');
+  const triggerTextClassName = compact
+    ? 'font-normal text-[13px] leading-5'
+    : 'font-medium text-sm';
+  const triggerIconClassName = compact ? 'h-3.5 w-3.5' : 'h-4 w-4';
+  const resolveModelIconProviderKey = (model: Model): string => {
+    const providerKey = model.providerKey?.trim();
+    if (providerKey && providerKey !== ProviderName.LobsteraiServer) return providerKey;
+
+    const searchableText = `${model.presetId ? modelPresetName(model.presetId) : model.name} ${model.id}`;
+    return MODEL_ICON_PROVIDER_HINTS.find(({ pattern }) => pattern.test(searchableText))?.providerName
+      ?? providerKey
+      ?? '';
+  };
+  const renderProviderIcon = (model: Model): React.ReactNode => {
+    if (model.presetId === ModelPresetId.Balanced) return (
+      <BalancedModelIcon className={MODEL_ICON_CLASS_NAME} />
+    );
+    if (model.presetId === ModelPresetId.Ultimate) return (
+      <UltimateModelIcon className={MODEL_ICON_CLASS_NAME} />
+    );
+    const icon = getProviderIcon(resolveModelIconProviderKey(model));
+    if (!React.isValidElement<{ className?: string }>(icon)) return icon;
+
+    const existingClassName = icon.props.className ? `${icon.props.className} ` : '';
+    return React.cloneElement(icon, {
+      className: `${existingClassName}${MODEL_ICON_CLASS_NAME}`,
+    });
+  };
+
+  // Refresh access and campaign metadata whenever the picker opens.
+  React.useEffect(() => {
+    if (isOpen && isLoggedIn) void authService.refreshServerModels();
+  }, [isOpen, isLoggedIn]);
+
+  // Refresh at campaign boundaries while the picker remains open.
+  React.useEffect(() => {
+    if (!isOpen || !isLoggedIn) return;
+    const now = Date.now();
+    const nextBoundary = availableModels.flatMap(model => model.limitedFree
+      ? [model.limitedFreeStartAt, model.limitedFreeEndAt] : [])
+      .map(value => value ? Date.parse(value) : NaN)
+      .filter(value => Number.isFinite(value) && value > now)
+      .sort((a, b) => a - b)[0];
+    if (nextBoundary == null) return;
+    const timer = window.setTimeout(() => { void authService.refreshServerModels(); },
+      Math.min(nextBoundary - now + 100, 2_147_483_647));
+    return () => window.clearTimeout(timer);
+  }, [availableModels, isOpen, isLoggedIn]);
+
+  // 点击外部区域关闭下拉框
+  React.useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as Node;
+      const isInsideTrigger = containerRef.current?.contains(target);
+      const isInsideDropdown = dropdownRef.current?.contains(target);
+      const isInsideHoverCard = hoverCardRef.current?.contains(target);
+      const isInsideThinkingMenu = thinkingMenuRef.current?.contains(target);
+
+      if (!isInsideTrigger && !isInsideDropdown && !isInsideHoverCard && !isInsideThinkingMenu) {
+        setIsOpen(false);
+      }
+    };
+
+    if (isOpen) {
+      document.addEventListener('mousedown', handleClickOutside, true);
+    }
+
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside, true);
+    };
+  }, [isOpen]);
+
+  const resolveDirection = React.useCallback(() => {
+    if (dropdownDirection !== 'auto') return dropdownDirection;
+    if (!containerRef.current) return 'down';
+    const rect = containerRef.current.getBoundingClientRect();
+    const spaceBelow = window.innerHeight - rect.bottom;
+    return spaceBelow < DROPDOWN_MAX_HEIGHT && rect.top > spaceBelow ? 'up' : 'down';
+  }, [dropdownDirection]);
+
+  const resolveListMaxHeight = React.useCallback((direction: 'up' | 'down'): number => {
+    const container = containerRef.current;
+    if (!container) return LIST_MAX_HEIGHT;
+    const rect = container.getBoundingClientRect();
+    let topBoundary = 0;
+    let bottomBoundary = window.innerHeight;
+    if (!portal) {
+      // The in-place dropdown is clipped by overflow ancestors (e.g. the app
+      // shell below the window title bar), so clamp against them as well.
+      for (let el = container.parentElement; el && el !== document.body; el = el.parentElement) {
+        if (window.getComputedStyle(el).overflowY === 'visible') continue;
+        const ancestorRect = el.getBoundingClientRect();
+        topBoundary = Math.max(topBoundary, ancestorRect.top);
+        bottomBoundary = Math.min(bottomBoundary, ancestorRect.bottom);
+      }
+    }
+    const availableSpace = (direction === 'up'
+      ? rect.top - topBoundary
+      : bottomBoundary - rect.bottom) - DROPDOWN_TRIGGER_GAP - DROPDOWN_VIEWPORT_MARGIN;
+    return resolveDropdownListMaxHeight(availableSpace, shouldShowGroupTabs, showCurrentModelFooter);
+  }, [portal, shouldShowGroupTabs, showCurrentModelFooter]);
+
+  const updatePortalPosition = React.useCallback((direction: 'up' | 'down') => {
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const desiredLeft = alignDropdownToTriggerEnd
+      ? rect.right - DROPDOWN_WIDTH
+      : rect.left;
+    const left = Math.min(
+      Math.max(desiredLeft, DROPDOWN_VIEWPORT_MARGIN),
+      window.innerWidth - DROPDOWN_WIDTH - DROPDOWN_VIEWPORT_MARGIN
+    );
+    const nextStyle: React.CSSProperties = {
+      left,
+      position: 'fixed',
+      width: DROPDOWN_WIDTH,
+      zIndex: 10000,
+    };
+
+    if (direction === 'up') {
+      nextStyle.bottom = window.innerHeight - rect.top + 4;
+    } else {
+      nextStyle.top = rect.bottom + 4;
+    }
+
+    setPortalStyle(nextStyle);
+  }, [alignDropdownToTriggerEnd]);
+
+  const updateInPlacePlacement = React.useCallback(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    // The in-place dropdown is wider than most triggers and is clipped by
+    // overflow ancestors, so flip the anchored edge (or cap the width) rather
+    // than letting its columns get cut off near a container edge.
+    const placement = resolvePopoverPlacement(container, {
+      preferredAlign: alignDropdownToTriggerEnd ? 'right' : 'left',
+      estimatedHeight: DROPDOWN_MAX_HEIGHT,
+      desiredWidth: DROPDOWN_WIDTH,
+    });
+    const next = {
+      alignEnd: placement.alignSide === 'right',
+      width: placement.maxWidth ?? DROPDOWN_WIDTH,
+    };
+    setInPlacePlacement(current => (
+      current.alignEnd === next.alignEnd && current.width === next.width ? current : next
+    ));
+  }, [alignDropdownToTriggerEnd]);
+
+  React.useEffect(() => {
+    if (!isOpen) return;
+
+    setListMaxHeight(resolveListMaxHeight(resolvedDirection));
+    const handlePositionUpdate = (event?: Event) => {
+      // Scrolls inside the dropdown itself (e.g. the model list) do not move the trigger.
+      if (event && event.target instanceof Node && dropdownRef.current?.contains(event.target)) return;
+      if (portal) {
+        updatePortalPosition(resolvedDirection);
+      } else {
+        updateInPlacePlacement();
+      }
+      setListMaxHeight(resolveListMaxHeight(resolvedDirection));
+    };
+    window.addEventListener('resize', handlePositionUpdate);
+    window.addEventListener('scroll', handlePositionUpdate, true);
+
+    return () => {
+      window.removeEventListener('resize', handlePositionUpdate);
+      window.removeEventListener('scroll', handlePositionUpdate, true);
+    };
+  }, [isOpen, portal, resolvedDirection, updatePortalPosition, updateInPlacePlacement, resolveListMaxHeight]);
+
+  React.useLayoutEffect(() => {
+    if (!isOpen || !selectedModelKey) return;
+
+    const scrollContainer = scrollContainerRef.current;
+    const selectedItem = selectedItemRef.current;
+    if (!scrollContainer || !selectedItem || !scrollContainer.contains(selectedItem)) return;
+
+    const containerRect = scrollContainer.getBoundingClientRect();
+    const selectedRect = selectedItem.getBoundingClientRect();
+    const selectedOffsetTop = selectedRect.top - containerRect.top + scrollContainer.scrollTop;
+    const targetScrollTop = selectedOffsetTop - ((scrollContainer.clientHeight - selectedItem.offsetHeight) / 2);
+    const maxScrollTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
+    scrollContainer.scrollTop = Math.min(Math.max(0, targetScrollTop), maxScrollTop);
+  }, [isOpen, selectedModelKey, visibleGroup, visibleModels.length, listMaxHeight]);
+
+  React.useLayoutEffect(() => {
+    if (!isOpen || !moreModelsExpanded || !revealMoreModelsOnExpandRef.current) return;
+
+    const scrollContainer = scrollContainerRef.current;
+    const moreModelsSection = moreModelsSectionRef.current;
+    if (!scrollContainer || !moreModelsSection) return;
+    revealMoreModelsOnExpandRef.current = false;
+
+    const containerRect = scrollContainer.getBoundingClientRect();
+    const sectionRect = moreModelsSection.getBoundingClientRect();
+    const sectionTop = sectionRect.top - containerRect.top + scrollContainer.scrollTop;
+    const sectionBottom = sectionTop + sectionRect.height;
+    const viewportTop = scrollContainer.scrollTop;
+    const viewportBottom = viewportTop + scrollContainer.clientHeight;
+    if (sectionTop >= viewportTop && sectionBottom <= viewportBottom) return;
+
+    const targetScrollTop = sectionRect.height <= scrollContainer.clientHeight
+      ? sectionBottom - scrollContainer.clientHeight
+      : sectionTop;
+    const maxScrollTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
+    scrollContainer.scrollTop = Math.min(Math.max(0, targetScrollTop), maxScrollTop);
+  }, [isOpen, moreModelsExpanded]);
+
+  const toggleOpen = () => {
+    if (disabled) return;
+    if (!isOpen) {
+      const nextDirection = resolveDirection();
+      setResolvedDirection(nextDirection);
+      setListMaxHeight(resolveListMaxHeight(nextDirection));
+      if (portal) {
+        updatePortalPosition(nextDirection);
+      } else {
+        updateInPlacePlacement();
+      }
+      const preferredGroup = getPreferredGroup();
+      setActiveGroup(preferredGroup);
+      setMoreModelsExpanded(
+        selectedModel?.moreModel === true && getModelGroup(selectedModel) === preferredGroup,
+      );
+      setIsOpen(true);
+    } else {
+      setIsOpen(false);
+    }
+  };
+
+  const resolveThinkingLevel = (
+    model: Model,
+    requestedLevel?: ModelThinkingLevelType,
+  ): ModelThinkingLevelType | undefined => {
+    if (!canConfigureModelThinking(model)) return undefined;
+    const config = model.thinkingConfig;
+    if (!config) return undefined;
+    return resolvePickerThinkingLevel({
+      config,
+      requestedLevel,
+      selectedModelLevel: isSelected(model) ? thinkingLevel : model.presetThinkingLevel,
+      rememberedLevel: model.presetId ? undefined : readRememberedModelThinkingLevel(getModelIdentityKey(model)),
+    });
+  };
+
+  const presetUsesDefaultThinking = (model: Model): boolean => !!model.presetId && !model.thinkingConfig
+    && !(isSelected(model) ? selectedModel?.presetThinkingLevel : model.presetThinkingLevel);
+  const thinkingLabelForModel = (model: Model): string | null => {
+    if (presetUsesDefaultThinking(model)) return i18nService.t('modelPresetThinkingDefault');
+    const level = resolveThinkingLevel(model) ?? model.thinkingConfig?.defaultLevel;
+    return level ? getModelThinkingLevelLabel(level) : null;
+  };
+
+  const handleLoginRequired = () => {
+    if (onLoginRequired) {
+      onLoginRequired();
+      return;
+    }
+    setRestrictedPrompt(ModelAccessPromptKind.Login);
+  };
+
+  const handleModelSelect = (model: Model | null) => {
+    if (disabled) return;
+    // Cached plan entries cannot determine login or purchase requirements while
+    // the account is being verified. The notice above the list offers recovery.
+    if (model?.isServerModel && accountConnectionState) return;
+    if (model?.busy) {
+      setRestrictedPrompt(ModelAccessPromptKind.Busy);
+      setHoveredModel(null);
+      setIsOpen(false);
+      return;
+    }
+    if (isModelAgenticBlocked(model)) {
+      setRestrictedPrompt(ModelAccessPromptKind.AgenticNotReady);
+      setHoveredModel(null);
+      setIsOpen(false);
+      return;
+    }
+    if (model?.presetId && model.accessible === false) {
+      window.dispatchEvent(new CustomEvent('app:showToast', { detail: model.restrictionHint || i18nService.t('agentModelInvalidHint') }));
+      return;
+    }
+    if (model && model.accessible === false) {
+      if (isLoggedIn) {
+        setRestrictedPrompt(model.subscriptionPriority
+          ? ModelAccessPromptKind.SubscriptionPriority : ModelAccessPromptKind.Subscribe);
+      } else {
+        handleLoginRequired();
+      }
+      setHoveredModel(null);
+      setIsOpen(false);
+      return;
+    }
+    const resolvedThinkingLevel = model && !presetUsesDefaultThinking(model) ? resolveThinkingLevel(model) : undefined;
+    if (controlled) {
+      onChange(model, {
+        group: getModelGroup(model) ?? visibleGroup,
+        ...(resolvedThinkingLevel ? { thinkingLevel: resolvedThinkingLevel } : {}),
+      });
+    } else if (model) {
+      dispatch(setSelectedModel({ agentId: currentAgentId, model }));
+    }
+    setRestrictedPrompt(null);
+    setIsThinkingMenuOpen(false);
+    setHoveredModel(null);
+    setIsOpen(false);
+  };
+
+  const handleThinkingLevelSelect = (
+    model: Model,
+    requestedThinkingLevel: ModelThinkingLevelType,
+  ) => {
+    if (disabled || !thinkingSelectionEnabled || !canConfigureModelThinking(model)) return;
+    const resolvedThinkingLevel = resolveThinkingLevel(model, requestedThinkingLevel);
+    if (!resolvedThinkingLevel) return;
+
+    // Each model keeps its own level, so picking one here must not be lost when
+    // the user switches to another model and back.
+    if (!model.presetId) rememberModelThinkingLevel(getModelIdentityKey(model), resolvedThinkingLevel);
+    onChange(model, {
+      group: getModelGroup(model) ?? visibleGroup,
+      thinkingLevel: resolvedThinkingLevel,
+    });
+    setRestrictedPrompt(null);
+  };
+
+  React.useEffect(() => {
+    if (!isOpen) {
+      setHoveredModel(null);
+      setIsThinkingMenuOpen(false);
+    }
+  }, [isOpen]);
+
+  React.useEffect(() => {
+    if (
+      isOpen
+      && selectedModel?.moreModel === true
+      && selectedModelGroup === visibleGroup
+    ) {
+      setMoreModelsExpanded(true);
+    }
+  }, [isOpen, selectedModel?.moreModel, selectedModelGroup, visibleGroup]);
+
+  React.useLayoutEffect(() => {
+    if (!hoveredModel || !hoverCardRef.current) return;
+
+    const cardRect = hoverCardRef.current.getBoundingClientRect();
+    const currentTop = typeof hoverCardStyle.top === 'number'
+      ? hoverCardStyle.top
+      : cardRect.top;
+    const nextTop = resolveHoverCardTop(currentTop, cardRect.height, window.innerHeight);
+
+    if (Math.abs(nextTop - currentTop) < 0.5) return;
+    setHoverCardStyle(style => ({ ...style, top: nextTop }));
+  }, [hoveredModel, hoverCardStyle.top]);
+
+  React.useLayoutEffect(() => {
+    if (!isThinkingMenuOpen || !thinkingMenuRef.current) return;
+    const menuRect = thinkingMenuRef.current.getBoundingClientRect();
+    const nextTop = resolveHoverCardTop(
+      menuRect.top,
+      menuRect.height,
+      window.innerHeight,
+    );
+    if (Math.abs(nextTop - menuRect.top) < 0.5) return;
+    setThinkingMenuStyle(style => ({ ...style, top: nextTop }));
+  }, [isThinkingMenuOpen, thinkingMenuStyle.left]);
+
+  React.useEffect(() => {
+    if (!isOpen) return;
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (isThinkingMenuOpen) {
+        setIsThinkingMenuOpen(false);
+      } else {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [isOpen, isThinkingMenuOpen]);
+
+  React.useEffect(() => () => {
+    if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+    if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current);
+  }, []);
+
+  React.useEffect(() => {
+    if (!showSelectedModelUnavailableFallback) {
+      selectedModelUnavailableFallbackLogKeyRef.current = '';
+      return;
+    }
+    if (selectedModelUnavailableFallbackLogKeyRef.current === selectedModelUnavailableFallbackLogKey) {
+      return;
+    }
+    selectedModelUnavailableFallbackLogKeyRef.current = selectedModelUnavailableFallbackLogKey;
+    const message = `preserving stale server model display while authenticated model list is empty: ${selectedModelUnavailableFallbackLogKey}`;
+    console.debug(`[ModelSelector] ${message}`);
+    try {
+      window.electron?.log?.fromRenderer?.('debug', 'ModelSelector', message);
+    } catch {
+      // Diagnostics only.
+    }
+  }, [
+    selectedModelUnavailableFallbackLogKey,
+    showSelectedModelUnavailableFallback,
+  ]);
+
+  // 如果没有可用模型，显示提示
+  if (availableModels.length === 0) {
+    if (connectionState) {
+      return (
+        <AccountConnectionNotice
+          state={connectionState}
+          className={`${triggerClassName} ${triggerTextClassName}`}
+          iconOnly={iconOnly}
+          disabled={disabled}
+        />
+      );
+    }
+    if (showSelectedModelUnavailableFallback) {
+      return (
+        <div ref={containerRef} className="relative cursor-wait">
+          <Tooltip content={triggerLabel} position={TooltipPosition.Top} delay={300} multiline disabled={!iconOnly}>
+            <button
+              type="button"
+              disabled
+              aria-disabled="true"
+              aria-label={iconOnly ? triggerLabel : undefined}
+              className={`flex min-w-0 items-center overflow-hidden text-foreground transition-colors disabled:cursor-wait disabled:opacity-70 ${triggerClassName}`}
+            >
+              <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center text-secondary">
+                {renderProviderIcon(selectedModel)}
+              </span>
+              <span className={iconOnly ? 'sr-only' : `${triggerTextClassName} min-w-0 truncate`}>{triggerLabel}</span>
+              {!iconOnly && <ChevronDownIcon className={`${triggerIconClassName} shrink-0 dark:text-claude-darkTextSecondary text-claude-textSecondary`} />}
+            </button>
+          </Tooltip>
+        </div>
+      );
+    }
+
+    if (shouldRenderPlanModelLoginPrompt(availableModels.length, isLoggedIn)) {
+      return (
+        <div ref={containerRef} className="relative">
+          <Tooltip
+            content={i18nService.t('modelSelectorLoginForPlanModels')}
+            position={TooltipPosition.Top}
+            delay={300}
+            multiline
+            disabled={!iconOnly || Boolean(restrictedPrompt)}
+          >
+            <button
+              type="button"
+              disabled={disabled}
+              onClick={handleLoginRequired}
+              className={`flex min-w-0 items-center overflow-hidden text-secondary transition-colors hover:bg-surface-raised hover:text-foreground disabled:cursor-wait disabled:opacity-70 ${triggerClassName}`}
+            >
+              <LockClosedIcon className={`${triggerIconClassName} shrink-0`} />
+              <span className={iconOnly ? 'sr-only' : `${triggerTextClassName} min-w-0 truncate`}>
+                {i18nService.t('modelSelectorLoginForPlanModels')}
+              </span>
+            </button>
+          </Tooltip>
+          {restrictedPrompt && (
+            <ModelAccessPromptModal
+              promptKind={restrictedPrompt}
+              onClose={() => setRestrictedPrompt(null)}
+            />
+          )}
+        </div>
+      );
+    }
+
+    return (
+      <Tooltip content={i18nService.t('modelSelectorNoModels')} position={TooltipPosition.Top} delay={300} multiline disabled={!iconOnly}>
+        <div
+          className={iconOnly ? 'flex h-8 w-8 items-center justify-center rounded-lg text-secondary' : 'px-3 py-1.5 rounded-xl bg-surface text-secondary text-sm'}
+        >
+          {iconOnly && <CustomProviderIcon className={MODEL_ICON_CLASS_NAME} />}
+          <span className={iconOnly ? 'sr-only' : undefined}>{i18nService.t('modelSelectorNoModels')}</span>
+        </div>
+      </Tooltip>
+    );
+  }
+
+  const dropdownPositionClass = resolvedDirection === 'up'
+    ? 'bottom-full mb-1'
+    : 'top-full mt-1';
+  const dropdownAlignmentClass = inPlacePlacement.alignEnd ? 'right-0' : 'left-0';
+
+  const isSelected = (model: Model): boolean => {
+    if (!selectedModel) return false;
+    return isSameModelIdentity(model, selectedModel);
+  };
+
+  const cancelHoverClose = () => {
+    if (hoverCloseTimerRef.current) {
+      clearTimeout(hoverCloseTimerRef.current);
+      hoverCloseTimerRef.current = null;
+    }
+  };
+
+  const handleModelHover = (
+    model: Model,
+    target: HTMLButtonElement,
+    delay = 200,
+  ) => {
+    cancelHoverClose();
+    if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+    const itemRect = target.getBoundingClientRect();
+    hoverTimerRef.current = setTimeout(() => {
+      if (!hasModelHoverDetails(model)) {
+        setHoveredModel(null);
+        return;
+      }
+      const dropdownEl = dropdownRef.current;
+      if (!dropdownEl) return;
+      const dropdownRect = dropdownEl.getBoundingClientRect();
+      const placement = resolveCascadePlacement({
+        anchorLeft: dropdownRect.left,
+        anchorRight: dropdownRect.right,
+        width: HOVER_CARD_WIDTH,
+        viewportWidth: window.innerWidth,
+        preferredSide: CascadeSide.Right,
+      });
+      setHoverCardSide(placement.side);
+      setHoverCardStyle({
+        position: 'fixed',
+        left: placement.left,
+        top: itemRect.top,
+        zIndex: 10001,
+      });
+      setIsThinkingMenuOpen(false);
+      setHoveredModel(model);
+    }, delay);
+  };
+
+  const handleModelHoverEnd = () => {
+    if (hoverTimerRef.current) {
+      clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
+    cancelHoverClose();
+    hoverCloseTimerRef.current = setTimeout(() => {
+      setHoveredModel(null);
+      setIsThinkingMenuOpen(false);
+      hoverCloseTimerRef.current = null;
+    }, HOVER_CLOSE_DELAY);
+  };
+
+  const openThinkingMenu = (trigger: HTMLElement) => {
+    if (!thinkingSelectionEnabled || !canConfigureModelThinking(hoveredModel)) {
+      setIsThinkingMenuOpen(false);
+      return;
+    }
+    // Already open for this model: keep the current placement so re-entering
+    // the trigger row does not make the menu jump.
+    if (isThinkingMenuOpen) return;
+    const card = hoverCardRef.current;
+    if (!card) return;
+    const cardRect = card.getBoundingClientRect();
+    const { left } = resolveNestedCascadePlacement({
+      anchorLeft: cardRect.left,
+      anchorRight: cardRect.right,
+      width: THINKING_MENU_WIDTH,
+      viewportWidth: window.innerWidth,
+      preferredSide: hoverCardSide,
+    });
+    setThinkingMenuStyle({
+      position: 'fixed',
+      left,
+      // Cascade from the row that opened the menu, not from the card top, so the
+      // two panels stay visually attached.
+      top: trigger.getBoundingClientRect().top,
+      width: THINKING_MENU_WIDTH,
+      zIndex: 10002,
+    });
+    setIsThinkingMenuOpen(true);
+  };
+
+  const renderModelItem = (model: Model) => {
+    const selected = isSelected(model);
+    const agenticBlocked = isModelAgenticBlocked(model);
+    const restricted = model.accessible === false;
+    const busy = model.busy === true;
+    const accountUnavailable = model.isServerModel === true && accountConnectionState !== null;
+    const blocked = restricted || agenticBlocked || busy || accountUnavailable;
+    const hasThinkingProtocol = supportsConfigurableModelThinkingProtocol(model);
+
+    const showCostMultiplier = model.costMultiplier != null && (model.costMultiplier > 0 || !!model.presetId || model.limitedFreeActive === true);
+    const costMultiplierLabel = showCostMultiplier
+      ? `x${model.costMultiplier?.toFixed(2)}`
+      : undefined;
+
+    // Keep names, tags and multipliers in fixed columns. Tags and multipliers
+    // align to their column starts so spare width cannot create leading gaps.
+    return (
+      <button
+        ref={selected ? selectedItemRef : undefined}
+        type="button"
+        key={getModelIdentityKey(model)}
+        disabled={accountUnavailable}
+        onClick={() => handleModelSelect(model)}
+        onMouseEnter={(event) => handleModelHover(model, event.currentTarget)}
+        onMouseLeave={handleModelHoverEnd}
+        onFocus={(event) => handleModelHover(model, event.currentTarget, 0)}
+        onBlur={handleModelHoverEnd}
+        aria-disabled={blocked}
+        aria-haspopup={thinkingSelectionEnabled && hasThinkingProtocol ? 'menu' : undefined}
+        className={`grid w-full grid-cols-[20px_minmax(0,1fr)_72px_40px_16px] items-center gap-x-1 rounded-lg px-2.5 py-2 text-left text-foreground transition-colors ${
+          accountUnavailable
+            ? 'cursor-not-allowed opacity-60'
+            : busy
+            ? 'cursor-not-allowed'
+            : blocked
+              ? 'cursor-pointer opacity-60 hover:bg-surface-raised'
+            : selected
+              ? 'bg-surface-raised'
+              : 'hover:bg-surface-raised'
+        }`}
+      >
+        <span className={`flex h-5 w-5 shrink-0 items-center justify-center text-secondary ${busy ? 'opacity-50 grayscale' : ''}`}>
+          {renderProviderIcon(model)}
+        </span>
+        <span
+          className={`min-w-0 truncate text-[13px] leading-5 ${selected ? 'font-medium' : 'font-normal'} ${busy ? 'text-secondary opacity-50' : ''}`}
+          title={hasModelHoverDetails(model) ? undefined : model.name}
+        >
+          {model.presetId ? modelPresetName(model.presetId) : model.name}
+        </span>
+        <span className="flex min-w-0 flex-col items-start gap-1">
+          {model.presetId && restricted && model.restrictionHint && (
+            <span className="max-w-full truncate text-[10px] text-secondary" title={model.restrictionHint}>{model.restrictionHint}</span>
+          )}
+          {!model.presetId && model.limitedFreeActive && (
+            <span className="inline-flex max-w-full items-center gap-[3px] whitespace-nowrap rounded-full bg-red-500/10 px-1.5 py-0.5 text-[10px] leading-none text-red-600 dark:text-red-400" title={i18nService.t('modelLimitedFreeBadge')}>
+              <GiftIcon className="h-3 w-3 shrink-0" strokeWidth={1.8} aria-hidden="true" />
+              <span className="truncate">{i18nService.t('modelLimitedFreeBadge')}</span>
+            </span>
+          )}
+          {model.subscriptionPriority && (
+            <span className="inline-flex max-w-full items-center gap-[3px] whitespace-nowrap rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[10px] leading-none text-amber-700 dark:text-amber-300" title={i18nService.t('modelSubscriptionPriorityHint')}>
+              <VipDiamondLineIcon className="h-3.5 w-3.5 shrink-0" />
+              <span className="truncate">{i18nService.t('modelSubscriptionPriorityBadge')}</span>
+            </span>
+          )}
+          {!busy && agenticBlocked && (
+            <span className="flex max-w-full items-center gap-1 rounded-md bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium leading-none text-amber-700 dark:text-amber-300" title={i18nService.t('modelSelectorAgenticVerifyingBadge')}>
+              <ClockIcon className="h-3 w-3 shrink-0" />
+              <span className="truncate">{i18nService.t('modelSelectorAgenticVerifyingBadge')}</span>
+            </span>
+          )}
+        </span>
+        <span className={`min-w-0 truncate text-left text-[11px] leading-4 tabular-nums text-secondary ${busy ? 'opacity-50' : ''}`} title={costMultiplierLabel}>
+          {costMultiplierLabel}
+        </span>
+        <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+          {restricted && !agenticBlocked && !busy && (
+            <LockClosedIcon className="h-3.5 w-3.5 text-secondary" />
+          )}
+          {selected && !blocked && (
+            <CheckIcon className="h-4 w-4 text-primary" strokeWidth={2.5} />
+          )}
+        </span>
+      </button>
+    );
+  };
+
+  // The server orders models by entitlement before applying busy availability.
+  // Preserve that order so a service outage cannot move a model to the bottom.
+  const renderModelRows = (models: Model[]) => models.map(renderModelItem);
+
+  const renderMoreModelsSection = () => {
+    if (visibleSections.moreModels.length === 0) return null;
+    const handleToggle = () => {
+      const nextExpanded = !moreModelsExpanded;
+      revealMoreModelsOnExpandRef.current = nextExpanded;
+      setMoreModelsExpanded(nextExpanded);
+    };
+    return (
+      <div ref={moreModelsSectionRef}>
+        <button
+          type="button"
+          aria-expanded={moreModelsExpanded}
+          onClick={handleToggle}
+          // A quiet expander rather than a filled bar, so it never reads as the
+          // (gray) selected row sitting right above it.
+          className="flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left text-[12px] font-medium leading-5 text-secondary transition-colors hover:bg-surface-raised hover:text-foreground"
+        >
+          <span>{i18nService.t('modelSelectorMoreModels')}</span>
+          <ChevronDownIcon
+            className={`h-4 w-4 shrink-0 text-secondary transition-transform ${moreModelsExpanded ? 'rotate-180' : ''}`}
+          />
+        </button>
+        {moreModelsExpanded && renderModelRows(visibleSections.moreModels)}
+      </div>
+    );
+  };
+
+  const renderHoverCard = () => {
+    if (!hoveredModel) return null;
+    const hasThinkingProtocol = supportsConfigurableModelThinkingProtocol(hoveredModel);
+    const thinkingConfigurable = thinkingSelectionEnabled && canConfigureModelThinking(hoveredModel);
+    const showThinkingBadge = !!hoveredModel.presetId || hoveredModel.supportsThinking;
+    const card = (
+      <div
+        ref={hoverCardRef}
+        style={hoverCardStyle}
+        onMouseEnter={cancelHoverClose}
+        onMouseLeave={handleModelHoverEnd}
+        onFocus={cancelHoverClose}
+        onBlur={handleModelHoverEnd}
+        className="w-[220px] rounded-xl border border-border bg-surface p-3 shadow-popover pointer-events-auto"
+      >
+        <div className="text-[13px] font-semibold text-foreground leading-5">{hoveredModel.presetId ? modelPresetName(hoveredModel.presetId) : hoveredModel.name}</div>
+        {hoveredModel.busy && (
+          <div className="mt-2 border-t border-border pt-2">
+            <p className="flex items-start gap-1.5 text-[11px] leading-4 text-red-600 dark:text-red-400">
+              <BusyModelIcon className="h-4 w-4 shrink-0" />
+              <span>{i18nService.t('modelBusyHint')}</span>
+            </p>
+          </div>
+        )}
+        {!hoveredModel.busy && hoveredModel.subscriptionPriority && (
+          <div className="mt-1 text-[11px] text-amber-700 dark:text-amber-300 leading-4">{i18nService.t('modelSubscriptionPriorityHint')}</div>
+        )}
+        {hoveredModel.presetId && hoveredModel.accessible === false && hoveredModel.restrictionHint && (
+          <div className="mt-1 text-[11px] text-secondary leading-4">{hoveredModel.restrictionHint}</div>
+        )}
+        {hoveredModel.description && (
+          <div className="mt-1 text-[11px] text-secondary leading-4">{hoveredModel.description}</div>
+        )}
+        {isModelAgenticBlocked(hoveredModel) && (
+          <div className="mt-2 rounded-lg bg-amber-500/10 px-2 py-1.5 text-[11px] leading-4 text-amber-700 dark:text-amber-300">
+            {i18nService.t('serverModelAgenticNotReady')}
+          </div>
+        )}
+        {hoveredModel.costMultiplier != null && hoveredModel.costMultiplier > 0 && (
+          <div className="mt-2 text-[11px] text-secondary">
+            ({i18nService.t('modelCostMultiplierLabel')} x{hoveredModel.costMultiplier.toFixed(2)})
+          </div>
+        )}
+        {(hoveredModel.supportsImage || showThinkingBadge) && (
+          <div className="mt-1.5 flex items-center gap-3 text-[11px] text-emerald-600">
+            {hoveredModel.supportsImage && (
+              <span className="flex items-center gap-1">
+                <span>✓</span>
+                <span>{i18nService.t('modelSupportsImageInputBadge')}</span>
+              </span>
+            )}
+            {showThinkingBadge && (
+              <span className="flex items-center gap-1">
+                <span>✓</span>
+                <span>{i18nService.t('modelSupportsThinkingBadge')}</span>
+              </span>
+            )}
+          </div>
+        )}
+        {thinkingSelectionEnabled && hasThinkingProtocol && hoveredModel.thinkingConfig && (
+          <button
+            ref={thinkingMenuTriggerRef}
+            type="button"
+            disabled={!thinkingConfigurable}
+            aria-disabled={!thinkingConfigurable}
+            onClick={(event) => openThinkingMenu(event.currentTarget)}
+            onMouseEnter={(event) => openThinkingMenu(event.currentTarget)}
+            onFocus={(event) => openThinkingMenu(event.currentTarget)}
+            aria-haspopup="menu"
+            aria-expanded={isThinkingMenuOpen}
+            // Bleeds into the card padding so the label still lines up with the
+            // text above it while the hover highlight keeps some breathing room.
+            className={`-mx-1.5 mt-1.5 flex w-[calc(100%+12px)] items-center justify-between rounded-lg px-1.5 py-2 text-left text-[12px] transition-colors ${
+              thinkingConfigurable
+                ? `text-foreground ${isThinkingMenuOpen ? 'bg-surface-raised' : 'hover:bg-surface-raised'}`
+                : 'cursor-not-allowed text-secondary opacity-60'
+            }`}
+          >
+            <span>{i18nService.t('modelThinkingStrength')}</span>
+            <span className="flex items-center gap-1 font-medium">
+              {thinkingLabelForModel(hoveredModel)}
+              {thinkingConfigurable
+                ? <ChevronRightIcon className="h-3.5 w-3.5 text-secondary" />
+                : <LockClosedIcon className="h-3.5 w-3.5 text-secondary" />}
+            </span>
+          </button>
+        )}
+        {!thinkingSelectionEnabled && hasThinkingProtocol && hoveredModel.thinkingConfig && (
+          <div className="mt-1.5 flex items-center justify-between py-2 text-[12px] text-foreground">
+            <span>{i18nService.t('modelThinkingStrength')}</span>
+            <span className="font-medium">{thinkingLabelForModel(hoveredModel)}</span>
+          </div>
+        )}
+      </div>
+    );
+    return createPortal(card, document.body);
+  };
+
+  const renderThinkingMenu = () => {
+    const config = hoveredModel?.thinkingConfig;
+    if (!thinkingSelectionEnabled || !hoveredModel || !config || !isThinkingMenuOpen
+      || !canConfigureModelThinking(hoveredModel)) return null;
+    const selectedLevel = presetUsesDefaultThinking(hoveredModel)
+      ? undefined : resolveThinkingLevel(hoveredModel) ?? config.defaultLevel;
+    return createPortal(
+      <div
+        ref={thinkingMenuRef}
+        style={thinkingMenuStyle}
+        onMouseEnter={cancelHoverClose}
+        onMouseLeave={handleModelHoverEnd}
+        onFocus={cancelHoverClose}
+        onBlur={handleModelHoverEnd}
+      >
+        <ModelThinkingMenu
+          config={config}
+          selectedLevel={selectedLevel}
+          onSelect={(level) => handleThinkingLevelSelect(hoveredModel, level)}
+          onEscape={() => setIsThinkingMenuOpen(false)}
+        />
+      </div>,
+      document.body,
+    );
+  };
+
+  const renderGroupTabs = () => (
+    <div className="border-b border-border/60 p-2">
+      <div className="flex rounded-lg bg-surface-raised p-0.5" role="tablist" aria-label={i18nService.t('model')}>
+        {modelGroups.map(group => {
+          const active = visibleGroup === group.key;
+          return (
+            <button
+              type="button"
+              key={group.key}
+              role="tab"
+              aria-selected={active}
+              onClick={() => {
+                setActiveGroup(group.key);
+                setMoreModelsExpanded(
+                  selectedModel?.moreModel === true && getModelGroup(selectedModel) === group.key,
+                );
+              }}
+              className={`flex min-w-0 flex-1 items-center justify-center rounded-md px-2 py-1.5 text-[12px] leading-4 transition-colors ${
+                active
+                  ? 'bg-surface font-semibold text-foreground shadow-sm'
+                  : 'font-medium text-secondary hover:text-foreground'
+              }`}
+            >
+              <span className="truncate">{group.label}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+
+  const renderCurrentModelFooter = () => {
+    if (!showCurrentModelFooter || !selectedModel || !selectedModelGroup) return null;
+    const inOtherGroup = selectedModelGroup !== visibleGroup;
+    return (
+      <button
+        type="button"
+        onClick={() => setActiveGroup(selectedModelGroup)}
+        className="flex w-full items-center gap-1.5 border-t border-border/60 px-3 py-2 text-left transition-colors hover:bg-surface-raised"
+      >
+        <span className="shrink-0 text-[11px] leading-4 text-secondary">
+          {i18nService.t('modelSelectorCurrentModel')}
+        </span>
+        <span className="min-w-0 truncate text-[12px] font-medium leading-4 text-foreground">
+          {selectedModel.presetId ? modelPresetName(selectedModel.presetId) : selectedModel.name}
+        </span>
+        {inOtherGroup && <ChevronRightIcon className="ml-auto h-3 w-3 shrink-0 text-secondary" />}
+      </button>
+    );
+  };
+
+  const renderRestrictedPrompt = () => {
+    if (!restrictedPrompt) return null;
+    return (
+      <ModelAccessPromptModal
+        promptKind={restrictedPrompt}
+        onClose={() => setRestrictedPrompt(null)}
+        anchorRef={anchorAccessPrompt ? containerRef : undefined}
+        onChooseModel={anchorAccessPrompt ? () => {
+          setRestrictedPrompt(null);
+          toggleOpen();
+        } : undefined}
+      />
+    );
+  };
+
+  const dropdown = isOpen ? (
+    <div
+      ref={dropdownRef}
+      style={portal ? portalStyle : { width: inPlacePlacement.width }}
+      className={`${portal ? '' : `absolute ${dropdownPositionClass} ${dropdownAlignmentClass}`} bg-surface rounded-xl popover-enter shadow-popover z-50 border-border border overflow-hidden`}
+    >
+      {shouldShowGroupTabs && renderGroupTabs()}
+      {connectionState && (
+        <AccountConnectionNotice state={connectionState} className="w-full px-3 py-2 text-xs" disabled={disabled} />
+      )}
+      <div
+        ref={scrollContainerRef}
+        style={{
+          maxHeight: listMaxHeight,
+          minHeight: stableListMinHeight !== undefined ? Math.min(stableListMinHeight, listMaxHeight) : undefined,
+        }}
+        className="model-selector-scroll overflow-y-auto px-1.5 py-1"
+      >
+        {defaultLabel && (
+          <button
+            type="button"
+            onClick={() => handleModelSelect(null)}
+            className={`flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-2 text-left text-foreground transition-colors ${
+              !selectedModel ? 'bg-surface-raised' : 'hover:bg-surface-raised'
+            }`}
+          >
+            <span className={`truncate text-[13px] leading-5 ${!selectedModel ? 'font-medium' : 'font-normal'}`}>{defaultLabel}</span>
+            {!selectedModel && <CheckIcon className="h-4 w-4 shrink-0 text-primary" strokeWidth={2.5} />}
+          </button>
+        )}
+        {renderModelRows(visibleSections.primaryModels)}
+        {renderMoreModelsSection()}
+      </div>
+      {renderCurrentModelFooter()}
+    </div>
+  ) : null;
+
+  return (
+    <div ref={containerRef} className={`relative ${disabled ? 'cursor-wait' : 'cursor-pointer'}`}>
+      <Tooltip content={triggerLabel} position={TooltipPosition.Top} delay={300} multiline disabled={!iconOnly || isOpen || Boolean(restrictedPrompt)}>
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={toggleOpen}
+          aria-label={iconOnly ? `${i18nService.t('model')}: ${triggerLabel}` : undefined}
+          aria-expanded={isOpen}
+          className={`flex min-w-0 items-center overflow-hidden hover:bg-surface-raised text-foreground transition-colors disabled:opacity-70 disabled:cursor-wait ${triggerClassName} ${selectedModel?.busy ? 'text-secondary opacity-60 grayscale' : ''} ${isOpen ? 'bg-surface-raised' : ''}`}
+        >
+          {(iconOnly || selectedModel?.isServerModel) && (
+            <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center text-secondary">
+              {selectedModel ? renderProviderIcon(selectedModel) : <CustomProviderIcon className={MODEL_ICON_CLASS_NAME} />}
+            </span>
+          )}
+          {!iconOnly && isCustomModelSelected && (
+            <span
+              className="inline-flex h-5 shrink-0 items-center gap-1 rounded-md bg-emerald-600/[0.07] px-1.5 text-[11px] font-medium leading-none text-emerald-800 ring-1 ring-inset ring-emerald-700/[0.08] dark:bg-emerald-400/[0.08] dark:text-emerald-200 dark:ring-emerald-300/[0.12]"
+              title={customProviderName
+                ? `${i18nService.t('modelGroupUser')} · ${customProviderName}`
+                : i18nService.t('modelGroupUser')}
+            >
+              <span className="flex shrink-0 items-center" aria-hidden="true">
+                <CustomProviderIcon className="h-3 w-3" />
+              </span>
+              <span className="shrink-0">{i18nService.t('modelSourceCustom')}</span>
+              {showCustomProviderName && (
+                <>
+                  <span className="shrink-0 opacity-50" aria-hidden="true">·</span>
+                  <span className="min-w-0 max-w-[80px] truncate">{customProviderName}</span>
+                </>
+              )}
+            </span>
+          )}
+          <span className={iconOnly ? 'sr-only' : `${triggerTextClassName} min-w-0 truncate`}>{selectedModel?.name ?? defaultLabel ?? ''}</span>
+          {isModelAgenticBlocked(selectedModel) && (
+            <ClockIcon
+              className={`${iconOnly ? 'absolute right-0 top-0 h-2.5 w-2.5 rounded-full bg-surface' : 'h-3.5 w-3.5 shrink-0'} text-amber-600 dark:text-amber-300`}
+              aria-label={i18nService.t('serverModelAgenticNotReady')}
+            />
+          )}
+          {!iconOnly && <ChevronDownIcon className={`${triggerIconClassName} shrink-0 dark:text-claude-darkTextSecondary text-claude-textSecondary`} />}
+        </button>
+      </Tooltip>
+
+      {portal && dropdown ? createPortal(dropdown, document.body) : dropdown}
+      {renderHoverCard()}
+      {renderThinkingMenu()}
+      {renderRestrictedPrompt()}
+    </div>
+  );
+};
+
+export default ModelSelector;
