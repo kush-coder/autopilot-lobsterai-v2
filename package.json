@@ -246,7 +246,7 @@
     "@univerjs/docs-ui": "1.0.2",
     "@univerjs/drawing": "1.0.2",
     "@univerjs/drawing-ui": "1.0.2",
-    "@univerjs/engine-formula": "1.0.2",
+    "@univerjs/engine-formula": "1.2.0",
     "@univerjs/engine-render": "1.0.2",
     "@univerjs/find-replace": "1.0.2",
     "@univerjs/rpc": "1.0.2",
